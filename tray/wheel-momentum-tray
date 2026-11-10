@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""
+wheel-momentum-tray -- tray icon and settings panel.
+
+Shows up in any StatusNotifierItem host (waybar, KDE, GNOME with an extension,
+...). Left click opens the menu: enable/disable, presets, settings, autostart.
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+
+from gi.repository import GLib, Gtk
+from gi.repository import AyatanaAppIndicator3 as AppIndicator
+
+APP_ID = "wheel-momentum-tray"
+CONF_DIR = os.path.expanduser("~/.config/wheel-momentum")
+CONF_PATH = os.path.join(CONF_DIR, "config.json")
+ICON_DIR = os.path.expanduser("~/.cache/wheel-momentum")
+SERVICE = "wheel-momentum.service"
+TRAY_SERVICE = "wheel-momentum-tray.service"
+
+DEFAULTS = {
+    "multiplier": 1.4,
+    "friction": 0.93,
+    "hz": 125,
+    "max_velocity": 4.0,
+    "stop_velocity": 0.02,
+    "exclude": [],
+    "include": [],
+}
+
+PRESETS = [
+    ("Soft", 1.9, 0.905),
+    ("Balanced", 1.4, 0.93),
+    ("Firm", 1.1, 0.96),
+    ("Instant", 1.0, 0.99),
+]
+
+
+# --------------------------------------------------------------------------- #
+# config
+# --------------------------------------------------------------------------- #
+def load_cfg():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONF_PATH, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_cfg(cfg):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    with open(CONF_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+# --------------------------------------------------------------------------- #
+# systemctl
+# --------------------------------------------------------------------------- #
+def sc(*args):
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", *args],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+
+
+def svc_active():
+    r = sc("is-active", "--quiet", SERVICE)
+    return bool(r and r.returncode == 0)
+
+
+def svc_enabled():
+    r = sc("is-enabled", "--quiet", SERVICE)
+    return bool(r and r.returncode == 0)
+
+
+def tray_enabled():
+    r = sc("is-enabled", "--quiet", TRAY_SERVICE)
+    return bool(r and r.returncode == 0)
+
+
+def svc_on():
+    sc("enable", SERVICE)
+    sc("start", SERVICE)
+
+
+def svc_off():
+    sc("stop", SERVICE)
+    sc("disable", SERVICE)
+
+
+def svc_restart():
+    if svc_active():
+        sc("restart", SERVICE)
+
+
+# --------------------------------------------------------------------------- #
+# icons (drawn with cairo, no theme dependency)
+# --------------------------------------------------------------------------- #
+def _rounded_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -1.5708, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+    cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+    cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+    cr.close_path()
+
+
+def make_icon(on):
+    """Write the icon into the icon theme so hosts can resolve it by name."""
+    name = "wheel-momentum-on" if on else "wheel-momentum-off"
+    base = os.path.expanduser("~/.local/share/icons/hicolor")
+    for size in (32, 64):
+        out_dir = os.path.join(base, f"{size}x{size}", "apps")
+        os.makedirs(out_dir, exist_ok=True)
+        _draw_icon(on, os.path.join(out_dir, name + ".png"), size)
+    try:
+        subprocess.run(["gtk-update-icon-cache", "-f", "-t", base],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+    return name
+
+
+def _draw_icon(on, path, S):
+    k = S / 64.0
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, S, S)
+    cr = cairo.Context(surf)
+    cr.scale(k, k)
+
+    if on:
+        fg = (0.36, 0.66, 1.0, 1.0)
+        bg = (0.36, 0.66, 1.0, 0.16)
+    else:
+        fg = (0.62, 0.62, 0.66, 1.0)
+        bg = (0.62, 0.62, 0.66, 0.10)
+
+    # body fill
+    cr.set_source_rgba(*bg)
+    _rounded_rect(cr, 17, 5, 30, 54, 15)
+    cr.fill()
+
+    # body outline
+    cr.set_source_rgba(*fg)
+    cr.set_line_width(4.2)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    _rounded_rect(cr, 17, 5, 30, 54, 15)
+    cr.stroke()
+
+    # wheel line
+    cr.set_line_width(4.2)
+    cr.move_to(32, 15)
+    cr.line_to(32, 26)
+    cr.stroke()
+
+    if on:
+        # motion waves
+        cr.set_line_width(3.4)
+        for r in (7, 13):
+            cr.arc(32, 32, r, 0.35, 1.25)
+            cr.stroke()
+    else:
+        # disabled: slash
+        cr.set_line_width(5.5)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.move_to(14, 52)
+        cr.line_to(50, 12)
+        cr.stroke()
+
+    surf.write_to_png(path)
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# slider row
+# --------------------------------------------------------------------------- #
+class SliderRow(Gtk.Box):
+    def __init__(self, title, hint, lo, hi, step, digits):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.label = Gtk.Label(label=title, xalign=0)
+        self.label.set_hexpand(True)
+        self.value = Gtk.Label(xalign=1)
+        self.value.get_style_context().add_class("dim-label")
+        head.pack_start(self.label, True, True, 0)
+        head.pack_start(self.value, False, False, 0)
+        self.pack_start(head, False, False, 0)
+
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
+        self.scale.set_digits(digits)
+        self.scale.set_draw_value(False)
+        self.scale.set_hexpand(True)
+        self.pack_start(self.scale, False, False, 0)
+
+        if hint:
+            h = Gtk.Label(label=hint, xalign=0)
+            h.get_style_context().add_class("dim-label")
+            h.set_line_wrap(True)
+            self.pack_start(h, False, False, 0)
+
+        self.scale.connect("value-changed", self._on_change)
+        self._cb = None
+
+    def _on_change(self, s):
+        self.value.set_text(f"{s.get_value():.{self.scale.get_digits()}f}")
+        if self._cb:
+            self._cb()
+
+    def connect_changed(self, cb):
+        self._cb = cb
+
+    def set_value(self, v):
+        self.scale.handler_block_by_func(self._on_change)
+        self.scale.set_value(v)
+        self.scale.handler_unblock_by_func(self._on_change)
+        self.value.set_text(f"{v:.{self.scale.get_digits()}f}")
+
+
+# --------------------------------------------------------------------------- #
+# app
+# --------------------------------------------------------------------------- #
+class Tray:
+    def __init__(self):
+        self.cfg = load_cfg()
+        self._pending = 0
+        self._building = False
+
+        GLib.set_prgname(APP_ID)
+        GLib.set_application_name("Wheel Momentum")
+
+        self.icon_on = make_icon(True)
+        self.icon_off = make_icon(False)
+
+        self.win = self._build_window()
+
+        self.ind = AppIndicator.Indicator.new(
+            APP_ID, self.icon_on, AppIndicator.IndicatorCategory.APPLICATION_STATUS
+        )
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.ind.set_title("Wheel Momentum")
+        self._build_menu()
+        self.sync()
+
+        GLib.timeout_add_seconds(2, self._tick)
+
+    # ---------------- menu ----------------
+    def _build_menu(self):
+        menu = Gtk.Menu()
+
+        self.mi_on = Gtk.CheckMenuItem(label="Enabled")
+        self.mi_on.connect("toggled", self._on_menu_toggle)
+        menu.append(self.mi_on)
+
+        presets = Gtk.MenuItem(label="Presets")
+        sub = Gtk.Menu()
+        self.preset_items = []
+        group = None
+        for name, mult, fric in PRESETS:
+            it = Gtk.RadioMenuItem(label=name)
+            if group is None:
+                group = it
+            else:
+                it.join_group(group)
+            it.connect("activate", self._on_menu_preset, mult, fric)
+            sub.append(it)
+            self.preset_items.append((it, mult, fric))
+        presets.set_submenu(sub)
+        menu.append(presets)
+
+        mi_settings = Gtk.MenuItem(label="Settings…")
+        mi_settings.connect("activate", lambda *_: self.show_window())
+        menu.append(mi_settings)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        self.mi_tray_auto = Gtk.CheckMenuItem(label="Start on login")
+        self.mi_tray_auto.connect("toggled", self._on_menu_autostart)
+        menu.append(self.mi_tray_auto)
+
+        mi_quit = Gtk.MenuItem(label="Quit")
+        mi_quit.connect("activate", self._on_quit)
+        menu.append(mi_quit)
+
+        menu.show_all()
+        self.menu = menu
+        self.ind.set_menu(menu)
+
+    def _on_menu_toggle(self, item):
+        if self._building:
+            return
+        if item.get_active():
+            svc_on()
+        else:
+            svc_off()
+        self.sync()
+
+    def _on_menu_preset(self, item, mult, fric):
+        if self._building or not item.get_active():
+            return
+        self.apply_preset(mult, fric)
+
+    def _on_menu_autostart(self, item):
+        if self._building:
+            return
+        if item.get_active():
+            sc("enable", TRAY_SERVICE)
+        else:
+            sc("disable", TRAY_SERVICE)
+        self.sync()
+
+    def _on_quit(self, *_):
+        Gtk.main_quit()
+
+    # ---------------- window ----------------
+    def _build_window(self):
+        win = Gtk.Window(title="Wheel Momentum")
+        win.set_default_size(430, -1)
+        win.set_border_width(16)
+        win.connect("delete-event", self._on_delete)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        win.add(outer)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        title = Gtk.Label(xalign=0)
+        title.set_markup("<b>Wheel Momentum</b>")
+        head.pack_start(title, True, True, 0)
+        self.sw = Gtk.Switch()
+        self.sw.connect("notify::active", self._on_switch)
+        head.pack_end(self.sw, False, False, 0)
+        outer.pack_start(head, False, False, 0)
+
+        self.status = Gtk.Label(xalign=0)
+        self.status.get_style_context().add_class("dim-label")
+        outer.pack_start(self.status, False, False, 0)
+
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        lbl = Gtk.Label(label="Presets", xalign=0)
+        outer.pack_start(lbl, False, False, 0)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_homogeneous(True)
+        self.preset_btns = []
+        for name, mult, fric in PRESETS:
+            b = Gtk.Button(label=name)
+            b.connect("clicked", lambda _b, m=mult, f=fric: self.apply_preset(m, f))
+            box.pack_start(b, True, True, 0)
+            self.preset_btns.append(b)
+        outer.pack_start(box, False, False, 0)
+
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        self.s_mult = SliderRow(
+            "Travel per detent",
+            "How far one detent carries you, in detents.",
+            0.6, 2.6, 0.05, 2)
+        self.s_fric = SliderRow(
+            "Glide",
+            "Lower means a longer, smoother tail.",
+            0.85, 0.99, 0.005, 3)
+        self.s_hz = SliderRow(
+            "Smoothness (Hz)",
+            "Higher is smoother, at a small CPU cost.",
+            60, 240, 5, 0)
+        self.s_vel = SliderRow(
+            "Max speed",
+            "Ceiling for rapid successive detents.",
+            1.0, 8.0, 0.5, 1)
+
+        for row in (self.s_mult, self.s_fric, self.s_hz, self.s_vel):
+            outer.pack_start(row, False, False, 0)
+            row.connect_changed(self._schedule_apply)
+
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.cb_auto = Gtk.CheckButton(label="Start on login")
+        self.cb_auto.connect("toggled", self._on_auto_toggle)
+        bottom.pack_start(self.cb_auto, True, True, 0)
+        b_reset = Gtk.Button(label="Defaults")
+        b_reset.connect("clicked", self._on_reset)
+        bottom.pack_end(b_reset, False, False, 0)
+        outer.pack_start(bottom, False, False, 0)
+
+        self._load_to_ui()
+        return win
+
+    def _on_delete(self, *_):
+        self.win.hide()
+        return True
+
+    def show_window(self):
+        self.sync()
+        self.win.show_all()
+        self.win.present()
+
+    # ---------------- UI <-> config ----------------
+    def _load_to_ui(self):
+        self._building = True
+        c = self.cfg
+        self.s_mult.set_value(float(c["multiplier"]))
+        self.s_fric.set_value(float(c["friction"]))
+        self.s_hz.set_value(float(c["hz"]))
+        self.s_vel.set_value(float(c["max_velocity"]))
+        self._building = False
+
+    def _ui_to_cfg(self):
+        self.cfg["multiplier"] = round(self.s_mult.scale.get_value(), 2)
+        self.cfg["friction"] = round(self.s_fric.scale.get_value(), 3)
+        self.cfg["hz"] = int(self.s_hz.scale.get_value())
+        self.cfg["max_velocity"] = round(self.s_vel.scale.get_value(), 1)
+
+    def _schedule_apply(self):
+        if self._building:
+            return
+        if self._pending:
+            GLib.source_remove(self._pending)
+        self._pending = GLib.timeout_add(400, self._apply)
+
+    def _apply(self):
+        self._pending = 0
+        self._ui_to_cfg()
+        save_cfg(self.cfg)
+        svc_restart()
+        self.sync()
+        return False
+
+    def apply_preset(self, mult, fric):
+        self.cfg["multiplier"] = mult
+        self.cfg["friction"] = fric
+        save_cfg(self.cfg)
+        self._load_to_ui()
+        svc_restart()
+        self.sync()
+
+    def _on_reset(self, *_):
+        for k in ("multiplier", "friction", "hz", "max_velocity"):
+            self.cfg[k] = DEFAULTS[k]
+        save_cfg(self.cfg)
+        self._load_to_ui()
+        svc_restart()
+        self.sync()
+
+    def _on_switch(self, sw, _pspec):
+        if self._building:
+            return
+        if sw.get_active():
+            svc_on()
+        else:
+            svc_off()
+        self.sync()
+
+    def _on_auto_toggle(self, btn):
+        if self._building:
+            return
+        if btn.get_active():
+            sc("enable", TRAY_SERVICE)
+        else:
+            sc("disable", TRAY_SERVICE)
+        self.sync()
+
+    # ---------------- state sync ----------------
+    def sync(self):
+        active = svc_active()
+        enabled = svc_enabled()
+
+        self._building = True
+        self.sw.set_active(active)
+        self.mi_on.set_active(active)
+        self.mi_tray_auto.set_active(tray_enabled())
+        self.cb_auto.set_active(tray_enabled())
+        self._building = False
+
+        if active:
+            txt = "Enabled"
+            self.ind.set_icon_full(self.icon_on, "Wheel Momentum")
+        else:
+            txt = "Off" + ("" if enabled else " (also disabled at login)")
+            self.ind.set_icon_full(self.icon_off, "Wheel Momentum")
+        self.status.set_text(txt)
+        self.ind.set_label("", "")
+        self._match_preset()
+
+    def _match_preset(self):
+        for it, mult, fric in self.preset_items:
+            if abs(mult - float(self.cfg["multiplier"])) < 0.001 and \
+               abs(fric - float(self.cfg["friction"])) < 0.001:
+                it.set_active(True)
+                return
+
+    def _tick(self):
+        self.sync()
+        return True
+
+
+PIDFILE = os.path.join(ICON_DIR, "tray.pid")
+
+
+def _already_running(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+
+def main():
+    os.makedirs(ICON_DIR, exist_ok=True)
+    want_show = "--show" in sys.argv
+
+    # Single instance: if one is already running, ask it to show the window.
+    pid = _already_running(PIDFILE)
+    if pid and pid != os.getpid():
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            pass
+        else:
+            try:
+                os.kill(pid, signal.SIGUSR1)
+            except OSError:
+                pass
+            return 0
+
+    app = Tray()
+    with open(PIDFILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+    try:
+        from gi.repository import GLibUnix
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
+                            lambda *_: (app.show_window(), True)[1])
+    except Exception:
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
+                             lambda *_: (app.show_window(), True)[1])
+
+    if want_show:
+        app.show_window()
+    Gtk.main()
+    try:
+        os.unlink(PIDFILE)
+    except OSError:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

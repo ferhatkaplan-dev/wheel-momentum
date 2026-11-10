@@ -1,0 +1,12 @@
+[Unit]
+Description=Wheel Momentum - inertial mouse wheel scrolling
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wheel-momentum
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Wheel Momentum tray applet
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wheel-momentum-tray
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

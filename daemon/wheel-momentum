@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""
+wheel-momentum -- system-wide inertial (momentum) mouse-wheel scrolling for Linux.
+
+How it works:
+  * Every mouse-like device (REL_X/REL_Y + wheel + BTN_LEFT) is taken over with
+    EVIOCGRAB and cloned 1:1 through uinput.
+  * Wheel detents are never forwarded as coarse events. Instead they are spread
+    into an exponentially decaying stream of high-resolution events
+    (REL_WHEEL_HI_RES, 120 units = one detent). Wayland (wlroots/sway), libinput
+    and GTK/Qt turn those into smooth axis values, so the page keeps gliding
+    and slowly settles after you stop turning the wheel.
+  * Touchpads (ABS_X) and devices without a wheel are never touched.
+
+Usage:
+  wheel-momentum               # run (no root needed, /dev/uinput access is enough)
+  wheel-momentum --selftest    # verify math + actual uinput emission
+
+Config: ~/.config/wheel-momentum/config.json (optional)
+"""
+
+import json
+import os
+import select
+import signal
+import sys
+import time
+
+try:
+    import evdev
+    from evdev import UInput, ecodes
+except ImportError:
+    sys.exit(
+        "python-evdev is missing. Run ./install.sh from the repository, or:\n"
+        "  python3 -m venv ~/.local/share/wheel-momentum/venv\n"
+        "  ~/.local/share/wheel-momentum/venv/bin/pip install evdev"
+    )
+
+PREFIX = "Wheel Momentum"
+UINPUT = "/dev/uinput"
+SCAN_INTERVAL_MS = 3000
+
+DEFAULT_CFG = {
+    # Total travel per detent (1.0 = exactly one detent, 1.4 = noticeable inertia)
+    "multiplier": 1.4,
+    # Damping: velocity is multiplied by this every 16.7 ms.
+    # 0.90 = long glide, 0.93 = balanced, 0.96 = stops quickly.
+    "friction": 0.93,
+    # Emission rate (Hz)
+    "hz": 125,
+    # Velocity ceiling (hi-res units/ms; 120 units = one detent)
+    "max_velocity": 4.0,
+    # Animation stops below this velocity
+    "stop_velocity": 0.02,
+    # Device names to skip (case-insensitive substring match)
+    "exclude": [],
+    # If non-empty, only these device names are grabbed
+    "include": [],
+}
+
+CONF_PATH = os.path.expanduser("~/.config/wheel-momentum/config.json")
+
+
+def log(msg):
+    print(f"[wheel-momentum] {msg}", flush=True)
+
+
+def load_cfg():
+    cfg = dict(DEFAULT_CFG)
+    try:
+        with open(CONF_PATH, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"could not read config ({e}), using defaults")
+    return cfg
+
+
+def now_ms():
+    return time.monotonic() * 1000.0
+
+
+class Handle:
+    """One physical device plus its uinput clone."""
+
+    def __init__(self, dev, cfg):
+        self.dev = dev
+        self.cfg = cfg
+        self.batch = []
+        self.v = 0.0        # hi-res units / ms
+        self.acc = 0.0      # rounding remainder
+        self.last_emit = 0.0
+        self.frame_ms = 1000.0 / float(cfg["hz"])
+        self.f_step = float(cfg["friction"]) ** (self.frame_ms / 16.7)
+
+        # Build the clone first, grab second: if cloning fails the mouse stays alive.
+        self.ui = self._create_clone()
+        self.out_path = self.ui.device.path
+        try:
+            dev.grab()
+        except OSError:
+            self.ui.close()
+            raise
+
+    def _create_clone(self):
+        caps = {}
+        for t, codes in self.dev.capabilities(absinfo=False).items():
+            if t in (ecodes.EV_KEY, ecodes.EV_REL):
+                caps[t] = sorted(set(codes))
+        if ecodes.REL_WHEEL_HI_RES not in caps.get(ecodes.EV_REL, []):
+            caps.setdefault(ecodes.EV_REL, []).append(ecodes.REL_WHEEL_HI_RES)
+        info = self.dev.info
+        return UInput(
+            events=caps,
+            name=self.dev.name,
+            vendor=info.vendor or 1,
+            product=info.product or 1,
+            bustype=info.bustype or 3,
+            version=info.version or 1,
+            phys="wheel-momentum",
+        )
+
+    # --- momentum ---
+    @property
+    def active(self):
+        return self.v != 0.0
+
+    def needs_emit(self, now):
+        return self.v != 0.0 and now - self.last_emit >= self.frame_ms
+
+    def kick(self, units, now):
+        """Add one detent to the current velocity (units: hi-res units)."""
+        if not units:
+            return
+        v0 = units * float(self.cfg["multiplier"]) * (1.0 - self.f_step) / self.frame_ms
+        vmax = float(self.cfg["max_velocity"])
+        self.v = max(-vmax, min(vmax, self.v + v0))
+        if self.last_emit <= 0.0:
+            self.last_emit = now - self.frame_ms
+
+    def maybe_emit(self, now):
+        if self.v == 0.0 or now - self.last_emit < self.frame_ms:
+            return
+        dt = min(now - self.last_emit, 50.0)
+        self.last_emit = now
+
+        self.acc += self.v * dt
+        n = int(self.acc)  # truncate toward zero
+        if n:
+            self.acc -= n
+            try:
+                self.ui.write(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, n)
+                self.ui.syn()
+            except OSError:
+                self.v = 0.0
+                return
+
+        self.v *= self.f_step ** (dt / self.frame_ms)
+        if abs(self.v) < float(self.cfg["stop_velocity"]):
+            self.v = 0.0
+            self.acc = 0.0
+            self.last_emit = 0.0
+
+    # --- event handling ---
+    def handle(self, ev, now):
+        if ev.type == ecodes.EV_SYN and ev.code == ecodes.SYN_REPORT:
+            self._flush(now)
+            return
+        self.batch.append(ev)
+
+    def _flush(self, now):
+        batch, self.batch = self.batch, []
+        coarse = 0
+        hires = 0
+        for ev in batch:
+            if ev.type == ecodes.EV_REL:
+                if ev.code == ecodes.REL_WHEEL:
+                    coarse += ev.value
+                    continue
+                if ev.code == ecodes.REL_WHEEL_HI_RES:
+                    hires += ev.value
+                    continue
+            try:
+                self.ui.write_event(ev)
+            except OSError:
+                return
+
+        # If the device reports both coarse and hi-res, trust hi-res.
+        units = hires if hires else coarse * 120
+        if units:
+            self.kick(units, now)
+
+        try:
+            self.ui.write(ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
+        except OSError:
+            pass
+
+    def close(self):
+        for fn in (self.dev.ungrab, self.ui.close, self.dev.close):
+            try:
+                fn()
+            except Exception:
+                pass
+
+
+def is_mouse(dev, cfg):
+    if dev.name.startswith(PREFIX):
+        return False
+    name = dev.name.lower()
+    if any(x.lower() in name for x in cfg["exclude"]):
+        return False
+    if cfg["include"] and not any(x.lower() in name for x in cfg["include"]):
+        return False
+    caps = dev.capabilities(absinfo=False)
+    rel = caps.get(ecodes.EV_REL, [])
+    keys = caps.get(ecodes.EV_KEY, [])
+    abs_axes = caps.get(ecodes.EV_ABS, [])
+    if ecodes.ABS_X in abs_axes:          # touchpad / tablet: leave alone
+        return False
+    if not (ecodes.REL_X in rel and ecodes.REL_Y in rel):
+        return False
+    if ecodes.REL_WHEEL not in rel and ecodes.REL_WHEEL_HI_RES not in rel:
+        return False
+    return ecodes.BTN_LEFT in keys
+
+
+def scan(handles, mine, cfg):
+    try:
+        paths = evdev.list_devices()
+    except Exception as e:
+        log(f"could not list devices: {e}")
+        return
+    for path in paths:
+        if path in handles or path in mine:
+            continue
+        try:
+            dev = evdev.InputDevice(path)
+        except Exception:
+            continue
+        if not is_mouse(dev, cfg):
+            dev.close()
+            continue
+        try:
+            h = Handle(dev, cfg)
+        except OSError:
+            dev.close()          # held by another process (EBUSY)
+            continue
+        except Exception as e:
+            log(f"could not clone {path}: {e}")
+            dev.close()
+            continue
+        handles[path] = h
+        mine.add(h.out_path)
+        log(f"grabbed: {dev.name} ({path} -> {h.out_path})")
+
+
+def run(cfg):
+    handles = {}
+    mine = set()
+    running = True
+
+    def stop(*_):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    log("started")
+    last_scan = 0.0
+    while running:
+        now = now_ms()
+        if now - last_scan >= SCAN_INTERVAL_MS:
+            scan(handles, mine, cfg)
+            last_scan = now
+
+        if not handles:
+            time.sleep(0.5)
+            continue
+
+        timeout = 0.5
+        active = [h for h in handles.values() if h.v != 0.0]
+        if active:
+            wait = min(h.last_emit + h.frame_ms - now for h in active)
+            timeout = max(0.001, min(wait / 1000.0, 0.5))
+
+        fds = {h.dev.fd: path for path, h in handles.items()}
+        try:
+            ready, _, _ = select.select(list(fds), [], [], timeout)
+        except (OSError, ValueError):
+            ready = []
+
+        now = now_ms()
+        for fd in ready:
+            path = fds[fd]
+            h = handles[path]
+            try:
+                for ev in h.dev.read():
+                    h.handle(ev, now)
+            except (OSError, BlockingIOError):
+                log(f"device gone: {path}")
+                h.close()
+                mine.discard(h.out_path)
+                handles.pop(path, None)
+
+        for h in list(handles.values()):
+            h.maybe_emit(now)
+
+    for h in list(handles.values()):
+        h.close()
+    log("stopped")
+
+
+def selftest(cfg):
+    """Verify real uinput emission and the math (touches no physical device)."""
+    caps = {
+        ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT],
+        ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y, ecodes.REL_WHEEL,
+                        ecodes.REL_WHEEL_HI_RES],
+    }
+    ui = UInput(events=caps, name=f"{PREFIX} selftest", vendor=1, product=1,
+                bustype=3, version=1)
+    h = Handle.__new__(Handle)
+    h.dev = None
+    h.cfg = cfg
+    h.batch = []
+    h.v = 0.0
+    h.acc = 0.0
+    h.last_emit = 0.0
+    h.frame_ms = 1000.0 / float(cfg["hz"])
+    h.f_step = float(cfg["friction"]) ** (h.frame_ms / 16.7)
+    h.ui = ui
+    h.out_path = ui.device.path
+
+    t0 = now_ms()
+    h.kick(120, t0)                     # one detent
+    emitted_events = 0
+    while h.v != 0.0 and now_ms() - t0 < 5000:
+        if h.needs_emit(now_ms()):
+            h.maybe_emit(now_ms())
+            emitted_events += 1
+        time.sleep(0.001)
+    elapsed = now_ms() - t0
+    ui.close()
+
+    # same constants, mathematical total
+    dt = h.frame_ms
+    f = h.f_step
+    v = 120 * float(cfg["multiplier"]) * (1 - f) / dt
+    dist = 0.0
+    steps = 0
+    while abs(v) >= float(cfg["stop_velocity"]):
+        dist += v * dt
+        v *= f
+        steps += 1
+
+    log(f"selftest: 1 detent -> {dist:.0f} hi-res units (~{dist/120:.2f} detents), "
+        f"{steps * dt:.0f} ms, {steps} emissions, real duration {elapsed:.0f} ms, "
+        f"{emitted_events} loop iterations")
+    return 0
+
+
+def main():
+    cfg = load_cfg()
+    if "--selftest" in sys.argv:
+        return selftest(cfg)
+    if not os.access(UINPUT, os.W_OK):
+        log(f"{UINPUT} is not writable (needs the input group or a udev rule)")
+        return 1
+    try:
+        run(cfg)
+    except Exception as e:
+        log(f"error: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

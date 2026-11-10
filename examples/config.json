@@ -1,0 +1,9 @@
+{
+  "multiplier": 1.4,
+  "friction": 0.93,
+  "hz": 125,
+  "max_velocity": 4.0,
+  "stop_velocity": 0.02,
+  "exclude": [],
+  "include": []
+}
