@@ -2,19 +2,28 @@
 """
 wheel-momentum -- system-wide inertial (momentum) mouse-wheel scrolling for Linux.
 
-How it works:
-  * Every mouse-like device (REL_X/REL_Y + wheel + BTN_LEFT) is taken over with
-    EVIOCGRAB and cloned 1:1 through uinput.
-  * Wheel detents are never forwarded as coarse events. Instead they are spread
-    into an exponentially decaying stream of high-resolution events
-    (REL_WHEEL_HI_RES, 120 units = one detent). Wayland (wlroots/sway), libinput
-    and GTK/Qt turn those into smooth axis values, so the page keeps gliding
-    and slowly settles after you stop turning the wheel.
-  * Touchpads (ABS_X) and devices without a wheel are never touched.
+Two modes (config key "mode"):
+
+  additive (default, cannot break input)
+      The device is only *read*. The original detent is delivered natively and
+      an extra decaying tail (multiplier - 1) is emitted on a separate virtual
+      device. Nothing is ever taken over, so clicks/scroll can never be lost.
+
+  grab (best feel, opt-in)
+      The device is taken over with EVIOCGRAB and cloned 1:1 through uinput.
+      Detents are replaced by a stream of high-resolution events, giving fully
+      smooth travel from the first pixel. Fail-open: any forwarding problem
+      immediately releases the device back to the kernel.
+
+Safety nets in both modes:
+  * every exception in a device handler releases that device (grab mode)
+  * systemd watchdog (Type=notify) kills a hung daemon, which drops the grab
+  * the kernel releases EVIOCGRAB automatically when the process dies
 
 Usage:
-  wheel-momentum               # run (no root needed, /dev/uinput access is enough)
-  wheel-momentum --selftest    # verify math + actual uinput emission
+  wheel-momentum                # run (no root, /dev/uinput access is enough)
+  wheel-momentum --selftest     # verify math + uinput emission
+  wheel-momentum --probe [sec]  # read-only: what does this device actually send?
 
 Config: ~/.config/wheel-momentum/config.json (optional)
 """
@@ -23,6 +32,7 @@ import json
 import os
 import select
 import signal
+import socket
 import sys
 import time
 
@@ -39,8 +49,12 @@ except ImportError:
 PREFIX = "Wheel Momentum"
 UINPUT = "/dev/uinput"
 SCAN_INTERVAL_MS = 3000
+MAX_FORWARD_ERRORS = 20     # consecutive failures before a device is released
+NOTIFY_INTERVAL_MS = 2000   # systemd watchdog ping rate
 
 DEFAULT_CFG = {
+    # "additive" = never grab (safe), "grab" = full takeover (smoother)
+    "mode": "additive",
     # Total travel per detent (1.0 = exactly one detent, 1.4 = noticeable inertia)
     "multiplier": 1.4,
     # Damping: velocity is multiplied by this every 16.7 ms.
@@ -54,7 +68,7 @@ DEFAULT_CFG = {
     "stop_velocity": 0.02,
     # Device names to skip (case-insensitive substring match)
     "exclude": [],
-    # If non-empty, only these device names are grabbed
+    # If non-empty, only these device names are handled
     "include": [],
 }
 
@@ -81,34 +95,76 @@ def now_ms():
     return time.monotonic() * 1000.0
 
 
-class Handle:
-    """One physical device plus its uinput clone."""
+# --------------------------------------------------------------------------- #
+# systemd notification + watchdog
+# --------------------------------------------------------------------------- #
+_sock = None
 
-    def __init__(self, dev, cfg):
+
+def sd_notify(state):
+    global _sock
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        if _sock is None:
+            _sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            _sock.connect(addr)
+        _sock.sendall(state.encode())
+    except OSError:
+        _sock = None
+
+
+# --------------------------------------------------------------------------- #
+# device handling
+# --------------------------------------------------------------------------- #
+class ForwardError(Exception):
+    pass
+
+
+class Handle:
+    """One input device: momentum state plus (optionally) its uinput clone."""
+
+    def __init__(self, dev, cfg, tail=None):
         self.dev = dev
         self.cfg = cfg
+        self.grab = str(cfg.get("mode", "additive")).lower() == "grab"
         self.batch = []
         self.v = 0.0        # hi-res units / ms
         self.acc = 0.0      # rounding remainder
         self.last_emit = 0.0
+        self.errors = 0
+        self.forwarded = 0
+        self.detents = 0
         self.frame_ms = 1000.0 / float(cfg["hz"])
         self.f_step = float(cfg["friction"]) ** (self.frame_ms / 16.7)
 
-        # Build the clone first, grab second: if cloning fails the mouse stays alive.
-        self.ui = self._create_clone()
+        if self.grab:
+            self.ui = self._create_clone()
+            self.owns_ui = True
+        else:
+            # Shared virtual mouse: only momentum is written to it, every real
+            # event continues to reach the system through the physical device.
+            self.ui = tail
+            self.owns_ui = False
         self.out_path = self.ui.device.path
-        try:
-            dev.grab()
-        except OSError:
-            self.ui.close()
-            raise
+        if self.grab:
+            try:
+                dev.grab()
+            except OSError:
+                self.ui.close()
+                raise
 
     def _create_clone(self):
         caps = {}
-        for t, codes in self.dev.capabilities(absinfo=False).items():
-            if t in (ecodes.EV_KEY, ecodes.EV_REL):
-                caps[t] = sorted(set(codes))
-        if ecodes.REL_WHEEL_HI_RES not in caps.get(ecodes.EV_REL, []):
+        for t, codes in self.dev.capabilities(absinfo=True).items():
+            if t == ecodes.EV_SYN:
+                continue
+            caps[t] = list(codes)
+        rel = caps.get(ecodes.EV_REL, [])
+        if ecodes.REL_WHEEL_HI_RES not in rel:
             caps.setdefault(ecodes.EV_REL, []).append(ecodes.REL_WHEEL_HI_RES)
         info = self.dev.info
         return UInput(
@@ -122,15 +178,11 @@ class Handle:
         )
 
     # --- momentum ---
-    @property
-    def active(self):
-        return self.v != 0.0
-
     def needs_emit(self, now):
         return self.v != 0.0 and now - self.last_emit >= self.frame_ms
 
     def kick(self, units, now):
-        """Add one detent to the current velocity (units: hi-res units)."""
+        """Add one detent worth of travel (units: hi-res units)."""
         if not units:
             return
         v0 = units * float(self.cfg["multiplier"]) * (1.0 - self.f_step) / self.frame_ms
@@ -152,7 +204,10 @@ class Handle:
             try:
                 self.ui.write(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, n)
                 self.ui.syn()
-            except OSError:
+            except OSError as e:
+                self.errors += 1
+                if self.errors >= MAX_FORWARD_ERRORS:
+                    raise ForwardError(f"cannot emit momentum: {e}")
                 self.v = 0.0
                 return
 
@@ -174,34 +229,75 @@ class Handle:
         coarse = 0
         hires = 0
         for ev in batch:
-            if ev.type == ecodes.EV_REL:
+            if ev.type == ecodes.EV_REL and ev.code in (ecodes.REL_WHEEL,
+                                                        ecodes.REL_WHEEL_HI_RES):
                 if ev.code == ecodes.REL_WHEEL:
                     coarse += ev.value
-                    continue
-                if ev.code == ecodes.REL_WHEEL_HI_RES:
+                else:
                     hires += ev.value
-                    continue
-            try:
-                self.ui.write_event(ev)
-            except OSError:
-                return
+                continue
+            if self.grab:
+                self._forward(ev)
 
         # If the device reports both coarse and hi-res, trust hi-res.
         units = hires if hires else coarse * 120
         if units:
+            self.detents += 1
+            if not self.grab:
+                # The detent itself was delivered natively; add only the tail.
+                units *= max(0.0, float(self.cfg["multiplier"]) - 1.0)
             self.kick(units, now)
 
+        if self.grab:
+            self._forward_syn()
+
+    def _forward(self, ev):
+        try:
+            self.ui.write_event(ev)
+            self.forwarded += 1
+            self.errors = 0
+        except OSError as e:
+            self.errors += 1
+            if self.errors == 1 or self.errors % 20 == 0:
+                name = ecodes.bytype.get(ev.type, {}).get(ev.code, ev.code)
+                log(f"{self.dev.name}: cannot forward {ecodes.EV.get(ev.type, ev.type)}"
+                    f"/{name} ({e}); errors={self.errors}")
+            if self.errors >= MAX_FORWARD_ERRORS:
+                raise ForwardError(f"cannot forward events: {e}")
+
+    def _forward_syn(self):
         try:
             self.ui.write(ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
         except OSError:
             pass
 
     def close(self):
-        for fn in (self.dev.ungrab, self.ui.close, self.dev.close):
+        fns = [getattr(self.dev, "ungrab", None)]
+        if self.owns_ui:
+            fns.append(self.ui.close)
+        fns.append(self.dev.close)
+        for fn in fns:
+            if fn is None:
+                continue
             try:
                 fn()
             except Exception:
                 pass
+
+
+def make_tail():
+    """Virtual pointer that carries only momentum events.
+
+    libinput ignores devices without buttons/axes, so this one advertises a
+    normal mouse shape. Nothing but REL_WHEEL_HI_RES is ever written to it.
+    """
+    caps = {
+        ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
+        ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y, ecodes.REL_WHEEL,
+                        ecodes.REL_WHEEL_HI_RES],
+    }
+    return UInput(events=caps, name=f"{PREFIX} wheel", vendor=1, product=1,
+                  bustype=3, version=1, phys="wheel-momentum")
 
 
 def is_mouse(dev, cfg):
@@ -225,14 +321,14 @@ def is_mouse(dev, cfg):
     return ecodes.BTN_LEFT in keys
 
 
-def scan(handles, mine, cfg):
+def scan(handles, mine, failed, cfg, tail):
     try:
         paths = evdev.list_devices()
     except Exception as e:
         log(f"could not list devices: {e}")
         return
     for path in paths:
-        if path in handles or path in mine:
+        if path in handles or path in mine or path in failed:
             continue
         try:
             dev = evdev.InputDevice(path)
@@ -242,23 +338,29 @@ def scan(handles, mine, cfg):
             dev.close()
             continue
         try:
-            h = Handle(dev, cfg)
+            h = Handle(dev, cfg, tail)
         except OSError:
             dev.close()          # held by another process (EBUSY)
             continue
         except Exception as e:
-            log(f"could not clone {path}: {e}")
+            log(f"could not set up {path}: {e}")
             dev.close()
+            failed.add(path)
             continue
         handles[path] = h
         mine.add(h.out_path)
-        log(f"grabbed: {dev.name} ({path} -> {h.out_path})")
+        mode = " [grab]" if h.grab else " [additive]"
+        log(f"attached: {dev.name} ({path} -> {h.out_path}){mode}")
 
 
 def run(cfg):
     handles = {}
     mine = set()
+    failed = set()
     running = True
+
+    grab = str(cfg.get("mode", "additive")).lower() == "grab"
+    tail = None if grab else make_tail()
 
     def stop(*_):
         nonlocal running
@@ -267,16 +369,21 @@ def run(cfg):
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
-    log("started")
+    log(f"started (mode={cfg.get('mode', 'additive')})")
     last_scan = 0.0
+    last_ping = 0.0
     while running:
         now = now_ms()
         if now - last_scan >= SCAN_INTERVAL_MS:
-            scan(handles, mine, cfg)
+            scan(handles, mine, failed, cfg, tail)
             last_scan = now
+            sd_notify("READY=1")
+        if now - last_ping >= NOTIFY_INTERVAL_MS:
+            sd_notify("WATCHDOG=1")
+            last_ping = now
 
         if not handles:
-            time.sleep(0.5)
+            time.sleep(0.2)
             continue
 
         timeout = 0.5
@@ -298,18 +405,72 @@ def run(cfg):
             try:
                 for ev in h.dev.read():
                     h.handle(ev, now)
+            except ForwardError as e:
+                log(f"{h.dev.name}: {e} -- releasing device back to the system")
+                h.close()
+                mine.discard(h.out_path)
+                handles.pop(path, None)
+                failed.add(path)
             except (OSError, BlockingIOError):
                 log(f"device gone: {path}")
                 h.close()
                 mine.discard(h.out_path)
                 handles.pop(path, None)
 
-        for h in list(handles.values()):
-            h.maybe_emit(now)
+        for path, h in list(handles.items()):
+            try:
+                h.maybe_emit(now)
+            except ForwardError as e:
+                log(f"{h.dev.name}: {e} -- releasing device back to the system")
+                h.close()
+                mine.discard(h.out_path)
+                handles.pop(path, None)
+                failed.add(path)
 
+    sd_notify("STOPPING=1")
     for h in list(handles.values()):
         h.close()
+    if tail is not None:
+        try:
+            tail.close()
+        except Exception:
+            pass
     log("stopped")
+
+
+def probe(seconds):
+    """Read-only: report what the devices send. Touches nothing, grabs nothing."""
+    ends = now_ms() + seconds * 1000
+    devs = []
+    for path in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(path)
+        except Exception:
+            continue
+        if is_mouse(d, DEFAULT_CFG):
+            devs.append(d)
+            log(f"probing: {d.name} ({path})")
+        else:
+            d.close()
+    if not devs:
+        log("no mouse-like devices found")
+        return 1
+    counts = {id(d): {} for d in devs}
+    while now_ms() < ends:
+        r, _, _ = select.select([d.fd for d in devs], [], [], 0.2)
+        for d in devs:
+            if d.fd not in r:
+                continue
+            for ev in d.read():
+                key = (ecodes.EV.get(ev.type, ev.type),
+                       ecodes.bytype.get(ev.type, {}).get(ev.code, ev.code))
+                counts[id(d)][key] = counts[id(d)].get(key, 0) + 1
+    for d in devs:
+        log(f"{d.name}:")
+        for (t, c), n in sorted(counts[id(d)].items(), key=lambda kv: -kv[1])[:12]:
+            print(f"    {t} {c}: {n}")
+        d.close()
+    return 0
 
 
 def selftest(cfg):
@@ -324,27 +485,30 @@ def selftest(cfg):
     h = Handle.__new__(Handle)
     h.dev = None
     h.cfg = cfg
+    h.grab = True
     h.batch = []
     h.v = 0.0
     h.acc = 0.0
     h.last_emit = 0.0
+    h.errors = 0
+    h.forwarded = 0
+    h.detents = 0
     h.frame_ms = 1000.0 / float(cfg["hz"])
     h.f_step = float(cfg["friction"]) ** (h.frame_ms / 16.7)
     h.ui = ui
     h.out_path = ui.device.path
 
     t0 = now_ms()
-    h.kick(120, t0)                     # one detent
-    emitted_events = 0
+    h.kick(120, t0)
+    emitted = 0
     while h.v != 0.0 and now_ms() - t0 < 5000:
         if h.needs_emit(now_ms()):
             h.maybe_emit(now_ms())
-            emitted_events += 1
+            emitted += 1
         time.sleep(0.001)
     elapsed = now_ms() - t0
     ui.close()
 
-    # same constants, mathematical total
     dt = h.frame_ms
     f = h.f_step
     v = 120 * float(cfg["multiplier"]) * (1 - f) / dt
@@ -357,7 +521,7 @@ def selftest(cfg):
 
     log(f"selftest: 1 detent -> {dist:.0f} hi-res units (~{dist/120:.2f} detents), "
         f"{steps * dt:.0f} ms, {steps} emissions, real duration {elapsed:.0f} ms, "
-        f"{emitted_events} loop iterations")
+        f"{emitted} loop iterations")
     return 0
 
 
@@ -365,6 +529,10 @@ def main():
     cfg = load_cfg()
     if "--selftest" in sys.argv:
         return selftest(cfg)
+    if "--probe" in sys.argv:
+        i = sys.argv.index("--probe")
+        secs = float(sys.argv[i + 1]) if len(sys.argv) > i + 1 else 5.0
+        return probe(secs)
     if not os.access(UINPUT, os.W_OK):
         log(f"{UINPUT} is not writable (needs the input group or a udev rule)")
         return 1

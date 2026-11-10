@@ -29,6 +29,7 @@ SERVICE = "wheel-momentum.service"
 TRAY_SERVICE = "wheel-momentum-tray.service"
 
 DEFAULTS = {
+    "mode": "additive",
     "multiplier": 1.4,
     "friction": 0.93,
     "hz": 125,
@@ -396,6 +397,14 @@ class Tray:
         bottom.pack_end(b_reset, False, False, 0)
         outer.pack_start(bottom, False, False, 0)
 
+        self.cb_safe = Gtk.CheckButton(label="Never take the device (game-safe)")
+        self.cb_safe.set_tooltip_text(
+            "On: clicks and scroll keep working in every app, including games "
+            "that read the mouse directly. Off: fully smooth scrolling, but "
+            "such games may lose mouse input.")
+        self.cb_safe.connect("toggled", self._on_safe_toggle)
+        outer.pack_start(self.cb_safe, False, False, 0)
+
         self._load_to_ui()
         return win
 
@@ -416,6 +425,7 @@ class Tray:
         self.s_fric.set_value(float(c["friction"]))
         self.s_hz.set_value(float(c["hz"]))
         self.s_vel.set_value(float(c["max_velocity"]))
+        self.cb_safe.set_active(c.get("mode", "additive") != "grab")
         self._building = False
 
     def _ui_to_cfg(self):
@@ -462,6 +472,14 @@ class Tray:
             svc_on()
         else:
             svc_off()
+        self.sync()
+
+    def _on_safe_toggle(self, btn):
+        if self._building:
+            return
+        self.cfg["mode"] = "additive" if btn.get_active() else "grab"
+        save_cfg(self.cfg)
+        svc_restart()
         self.sync()
 
     def _on_auto_toggle(self, btn):
