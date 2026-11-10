@@ -1,0 +1,17 @@
+name: Feature request
+description: An idea that would make the glide better
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like?
+      description: Describe the behaviour, not only the implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What does your current setup make annoying?

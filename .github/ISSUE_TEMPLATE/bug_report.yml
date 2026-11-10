@@ -1,0 +1,65 @@
+name: Bug report
+description: Scrolling glides too much, not at all, or input stops working
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. The two fields below answer most questions,
+        so they are required.
+
+  - type: input
+    id: system
+    attributes:
+      label: Distribution and kernel
+      placeholder: CachyOS, 7.2.1
+    validations:
+      required: true
+
+  - type: input
+    id: desktop
+    attributes:
+      label: Desktop and session type
+      description: e.g. Sway 1.11 (Wayland), Hyprland, KDE Plasma 6 Wayland, GNOME X11
+      placeholder: Sway 1.11, Wayland
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - additive (default)
+        - grab
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What did you expect, and what happened instead? Mention the app if it only happens in one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: probe
+    attributes:
+      label: Device probe
+      description: Output of `wheel-momentum --probe 5` (press scroll while it runs)
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output of `journalctl --user -u wheel-momentum -n 50 --no-pager`
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v1.0.0 / de90d3a

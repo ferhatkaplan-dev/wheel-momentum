@@ -1,7 +1,22 @@
+<p align="center">
+  <img src="docs/banner.png" alt="wheel-momentum — inertial mouse-wheel scrolling for Linux" width="100%">
+</p>
+
 # wheel-momentum
 
-Inertial (momentum) scrolling for the mouse wheel on Linux — the same buttery
-glide your touchpad has, in every application.
+**Inertial (momentum) scrolling for the mouse wheel on Linux — the same buttery
+glide your touchpad has, in every application.**
+
+[![Release](https://img.shields.io/github/v/release/ferhatkaplan-dev/wheel-momentum?color=4a9eff)](https://github.com/ferhatkaplan-dev/wheel-momentum/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)](#requirements)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
+[![No root](https://img.shields.io/badge/daemon-no%20root-success)](#permissions)
+
+```bash
+git clone https://github.com/ferhatkaplan-dev/wheel-momentum.git
+cd wheel-momentum && ./install.sh
+```
 
 A scroll wheel only sends discrete detents: no velocity, no "release" event,
 so browsers and toolkits can only animate each step. **wheel-momentum** sits
@@ -21,6 +36,18 @@ It runs in one of two modes:
 |---|---|---|---|
 | `additive` *(default)* | Only read, never taken over | Detent + smooth tail | **Yes** — input can never be lost |
 | `grab` | Taken over (`EVIOCGRAB`) and cloned 1:1 | Fully smooth from the first pixel | No — apps that read `/dev/input` directly (Wine/Proton, SDL raw input) stop receiving it |
+
+## Why not just…
+
+| Approach | Limitation |
+|---|---|
+| `imwheel` | X11 only; replays coarse detents, so Wayland and pixel-smooth motion are out |
+| Browser extension | works inside one browser, nowhere else |
+| `libinput` scroll factor / kinetic settings | change touchpads, not mouse wheels |
+| App-level "smooth scrolling" toggles | one app or toolkit at a time |
+
+**wheel-momentum** works at the evdev layer, so every application — terminal,
+editor, browser, Electron app, GTK/Qt — gets the same glide, on Wayland and X11.
 
 ## Features
 
@@ -166,14 +193,6 @@ Presets shipped with the tray:
 ./uninstall.sh          # keeps ~/.config/wheel-momentum
 ./uninstall.sh --purge  # removes config too
 ```
-
-## Optional: Zen/Firefox extension
-
-`zen-extension/` contains a standalone WebExtension that does the same decay in
-JavaScript inside the browser (no system access needed). Install it from
-`about:addons` → gear → *Install Add-on From File…*; `xpinstall.signatures.required`
-must be `false` for an unsigned build. Do not run it together with the daemon —
-one is enough.
 
 ## License
 
