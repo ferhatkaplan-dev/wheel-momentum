@@ -1,13 +1,15 @@
 [Unit]
 Description=Wheel Momentum - inertial mouse wheel scrolling
 After=graphical-session.target
+# Crash-loop protection only; config changes are applied with SIGHUP, not restarts.
 StartLimitIntervalSec=60
-StartLimitBurst=5
+StartLimitBurst=20
 
 [Service]
 Type=notify
 NotifyAccess=main
 ExecStart=%h/.local/bin/wheel-momentum
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 # If the event loop hangs, systemd kills it and the kernel drops the grab.

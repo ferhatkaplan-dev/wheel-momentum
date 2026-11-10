@@ -79,9 +79,15 @@ def sc(*args):
         return None
 
 
+def svc_state():
+    """ActiveState, including transitional states."""
+    r = sc("show", "-p", "ActiveState", "--value", SERVICE)
+    return r.stdout.strip() if r and r.returncode == 0 else "unknown"
+
+
 def svc_active():
-    r = sc("is-active", "--quiet", SERVICE)
-    return bool(r and r.returncode == 0)
+    # "activating" matters: the unit is Type=notify and briefly not "active".
+    return svc_state() in ("active", "activating", "reloading")
 
 
 def svc_enabled():
@@ -95,8 +101,10 @@ def tray_enabled():
 
 
 def svc_on():
+    sc("reset-failed", SERVICE)   # clears start-limit-hit from earlier restarts
     sc("enable", SERVICE)
-    sc("start", SERVICE)
+    r = sc("start", SERVICE)
+    return bool(r and r.returncode == 0)
 
 
 def svc_off():
@@ -104,9 +112,13 @@ def svc_off():
     sc("disable", SERVICE)
 
 
-def svc_restart():
+def svc_reload():
+    """Apply the config without restarting (no systemd start rate-limit)."""
     if svc_active():
-        sc("restart", SERVICE)
+        sc("kill", "--signal=HUP", SERVICE)
+    elif svc_enabled():
+        sc("reset-failed", SERVICE)
+        sc("start", SERVICE)
 
 
 # --------------------------------------------------------------------------- #
@@ -445,7 +457,7 @@ class Tray:
         self._pending = 0
         self._ui_to_cfg()
         save_cfg(self.cfg)
-        svc_restart()
+        svc_reload()
         self.sync()
         return False
 
@@ -454,7 +466,7 @@ class Tray:
         self.cfg["friction"] = fric
         save_cfg(self.cfg)
         self._load_to_ui()
-        svc_restart()
+        svc_reload()
         self.sync()
 
     def _on_reset(self, *_):
@@ -462,7 +474,7 @@ class Tray:
             self.cfg[k] = DEFAULTS[k]
         save_cfg(self.cfg)
         self._load_to_ui()
-        svc_restart()
+        svc_reload()
         self.sync()
 
     def _on_switch(self, sw, _pspec):
@@ -479,7 +491,7 @@ class Tray:
             return
         self.cfg["mode"] = "additive" if btn.get_active() else "grab"
         save_cfg(self.cfg)
-        svc_restart()
+        svc_reload()
         self.sync()
 
     def _on_auto_toggle(self, btn):
@@ -493,7 +505,8 @@ class Tray:
 
     # ---------------- state sync ----------------
     def sync(self):
-        active = svc_active()
+        state = svc_state()
+        active = state in ("active", "activating", "reloading")
         enabled = svc_enabled()
 
         self._building = True
@@ -501,11 +514,15 @@ class Tray:
         self.mi_on.set_active(active)
         self.mi_tray_auto.set_active(tray_enabled())
         self.cb_auto.set_active(tray_enabled())
+        self.cb_safe.set_active(self.cfg.get("mode", "additive") != "grab")
         self._building = False
 
         if active:
             txt = "Enabled"
             self.ind.set_icon_full(self.icon_on, "Wheel Momentum")
+        elif state == "failed":
+            txt = "Failed - switch off and on to reset"
+            self.ind.set_icon_full(self.icon_off, "Wheel Momentum")
         else:
             txt = "Off" + ("" if enabled else " (also disabled at login)")
             self.ind.set_icon_full(self.icon_off, "Wheel Momentum")

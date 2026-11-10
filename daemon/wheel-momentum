@@ -177,6 +177,14 @@ class Handle:
             phys="wheel-momentum",
         )
 
+    def update_cfg(self, cfg):
+        """Apply a reloaded config without touching the device."""
+        self.cfg = cfg
+        self.frame_ms = 1000.0 / float(cfg["hz"])
+        self.f_step = float(cfg["friction"]) ** (self.frame_ms / 16.7)
+        vmax = float(cfg["max_velocity"])
+        self.v = max(-vmax, min(vmax, self.v))
+
     # --- momentum ---
     def needs_emit(self, now):
         return self.v != 0.0 and now - self.last_emit >= self.frame_ms
@@ -358,6 +366,7 @@ def run(cfg):
     mine = set()
     failed = set()
     running = True
+    reload_req = False
 
     grab = str(cfg.get("mode", "additive")).lower() == "grab"
     tail = None if grab else make_tail()
@@ -366,14 +375,44 @@ def run(cfg):
         nonlocal running
         running = False
 
+    def reload(*_):
+        nonlocal reload_req
+        reload_req = True
+
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, reload)
 
     log(f"started (mode={cfg.get('mode', 'additive')})")
     last_scan = 0.0
     last_ping = 0.0
     while running:
         now = now_ms()
+        if reload_req:
+            reload_req = False
+            new = load_cfg()
+            new_grab = str(new.get("mode", "additive")).lower() == "grab"
+            if new_grab != grab:
+                log(f"mode changed -> {new.get('mode', 'additive')}, rebuilding devices")
+                for h in list(handles.values()):
+                    h.close()
+                handles.clear()
+                mine.clear()
+                failed.clear()
+                if tail is not None:
+                    try:
+                        tail.close()
+                    except Exception:
+                        pass
+                    tail = None
+                grab = new_grab
+                tail = None if grab else make_tail()
+                last_scan = 0.0
+            else:
+                for h in handles.values():
+                    h.update_cfg(new)
+                log("config reloaded")
+            cfg = new
         if now - last_scan >= SCAN_INTERVAL_MS:
             scan(handles, mine, failed, cfg, tail)
             last_scan = now

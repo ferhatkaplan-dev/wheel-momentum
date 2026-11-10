@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.1
+
+- Settings changes no longer restart the daemon: the tray sends `SIGHUP` and the
+  daemon applies multiplier/friction/rate/max speed live. This avoids systemd's
+  start rate limit, which could leave the service `failed` with
+  `start-limit-hit` after a few slider moves.
+- `mode` changes apply over `SIGHUP` too: devices are rebuilt in place.
+- Enabling from the tray clears a failed state (`reset-failed`) first.
+- The tray treats `activating` as enabled, so it no longer shows *Off* while the
+  `Type=notify` unit is still starting.
+
 ## 1.0.0
 
 First public release.

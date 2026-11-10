@@ -123,7 +123,7 @@ CLI:
 
 ```bash
 systemctl --user status wheel-momentum       # state
-systemctl --user restart wheel-momentum      # after editing config
+systemctl --user reload wheel-momentum       # apply config edits
 systemctl --user stop wheel-momentum         # mouse returns to native instantly
 journalctl --user -u wheel-momentum -f       # live log ("attached: ..." lines)
 wheel-momentum --selftest                    # verify math + uinput emission
@@ -132,8 +132,8 @@ wheel-momentum --probe 5                     # read-only: what do your devices s
 
 ## Configuration
 
-`~/.config/wheel-momentum/config.json`, then
-`systemctl --user restart wheel-momentum` (or use the panel, which does it for you).
+`~/.config/wheel-momentum/config.json`. The tray applies changes instantly;
+from a terminal run `systemctl --user reload wheel-momentum`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -182,6 +182,7 @@ Presets shipped with the tray:
 | Nothing happens | `journalctl --user -u wheel-momentum -f` — did it print `attached: <your mouse>`? |
 | Mouse acts up | `systemctl --user stop wheel-momentum` returns everything to native instantly |
 | Clicks/scroll lost in a game | you are in `grab` mode — switch to `additive` |
+| Settings seem ignored, service `failed` | run `systemctl --user reset-failed wheel-momentum` (the tray does this on enable) |
 | No smooth scrolling in one app | that app may ignore high-resolution wheel events; try `hz` 200 |
 | No tray icon | your bar needs a StatusNotifierItem host (waybar's `tray` module) |
 | "uinput is not writable" | see [Permissions](#permissions) |
