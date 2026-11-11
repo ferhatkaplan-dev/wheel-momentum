@@ -11,6 +11,7 @@ import os
 import signal
 import subprocess
 import sys
+import textwrap
 
 import cairo
 import gi
@@ -30,6 +31,7 @@ TRAY_SERVICE = "wheel-momentum-tray.service"
 
 DEFAULTS = {
     "mode": "additive",
+    "language": "auto",
     "multiplier": 1.4,
     "friction": 0.93,
     "hz": 125,
@@ -40,11 +42,173 @@ DEFAULTS = {
 }
 
 PRESETS = [
-    ("Soft", 1.9, 0.905),
-    ("Balanced", 1.4, 0.93),
-    ("Firm", 1.1, 0.96),
-    ("Instant", 1.0, 0.99),
+    ("soft", 1.9, 0.905),
+    ("balanced", 1.4, 0.93),
+    ("firm", 1.1, 0.96),
+    ("instant", 1.0, 0.99),
 ]
+
+
+# --------------------------------------------------------------------------- #
+# translations
+# --------------------------------------------------------------------------- #
+STRINGS = {
+    "en": {
+        "enabled": "Enabled",
+        "off": "Off",
+        "off_login": "Off (also disabled at login)",
+        "failed": "Failed - switch off and on to reset",
+        "menu.enabled": "Enabled",
+        "switch.tip": "Starts or stops the scrolling service.",
+        "menu.presets": "Presets",
+        "menu.settings": "Settings…",
+        "menu.autostart": "Start on login",
+        "menu.quit": "Quit",
+        "presets": "Presets",
+        "window.title": "Wheel Momentum - Settings",
+        "row.multiplier": "Travel per detent",
+        "row.multiplier.hint": "How far one detent carries you.",
+        "row.multiplier.tip": (
+            "Total distance one wheel notch moves, in detents.\n"
+            "1.00 = exactly one notch, 1.40 = 40% extra glide.\n"
+            "Tip: 1.2-1.6 feels natural; above 2.0 the glide can overshoot."),
+        "row.friction": "Glide",
+        "row.friction.hint": "Lower means a longer, smoother tail.",
+        "row.friction.tip": (
+            "How quickly the glide fades.\n"
+            "Every 16.7 ms the speed is multiplied by this value.\n"
+            "0.90 = long silky tail, 0.93 = balanced, 0.96 = stops quickly."),
+        "row.hz": "Smoothness (Hz)",
+        "row.hz.hint": "Higher is smoother, at a small CPU cost.",
+        "row.hz.tip": (
+            "Event rate while gliding.\n"
+            "125 Hz is smooth on 60-120 Hz screens; raise it to 200 Hz for "
+            "high-refresh displays.\n"
+            "Higher values cost a little CPU."),
+        "row.velocity": "Max speed",
+        "row.velocity.hint": "Ceiling for rapid successive detents.",
+        "row.velocity.tip": (
+            "Speed limit when you spin the wheel quickly.\n"
+            "Lower = more controlled, higher = more fling.\n"
+            "Only matters for fast bursts, not single notches."),
+        "safe": "Never take the device (game-safe)",
+        "safe.tip": (
+            "On: the mouse is only read. Clicks and scroll always work, "
+            "including games and Wine/Proton apps that read the input device "
+            "directly.\n"
+            "Off: the device is cloned for fully smooth scrolling, but those "
+            "apps may lose mouse input while it is active."),
+        "autostart": "Start on login",
+        "autostart.tip": (
+            "Starts the tray applet automatically when you log in.\n"
+            "The scrolling service itself is controlled by the switch above."),
+        "defaults": "Defaults",
+        "defaults.tip": "Restore 1.4x travel, 0.93 glide, 125 Hz and 4.0 max speed.",
+        "language": "Language",
+        "language.tip": "Language of this panel and the tray menu.",
+        "lang.auto": "Automatic",
+        "preset.soft": "Soft",
+        "preset.balanced": "Balanced",
+        "preset.firm": "Firm",
+        "preset.instant": "Instant",
+        "preset.soft.tip": "Long, obvious glide (1.9 x 0.905).",
+        "preset.balanced.tip": "The recommended middle ground (1.4 x 0.93).",
+        "preset.firm.tip": "Short and controlled (1.1 x 0.96).",
+        "preset.instant.tip": "No glide, almost raw wheel (1.0 x 0.99).",
+    },
+    "tr": {
+        "enabled": "Açık",
+        "off": "Kapalı",
+        "off_login": "Kapalı (oturum açılışında da kapalı)",
+        "failed": "Hata - sıfırlamak için kapatıp açın",
+        "menu.enabled": "Etkin",
+        "switch.tip": "Kaydırma servisini başlatır veya durdurur.",
+        "menu.presets": "Hazır ayarlar",
+        "menu.settings": "Ayarlar…",
+        "menu.autostart": "Oturumda başlat",
+        "menu.quit": "Çıkış",
+        "presets": "Hazır ayarlar",
+        "window.title": "Wheel Momentum - Ayarlar",
+        "row.multiplier": "Tık başına mesafe",
+        "row.multiplier.hint": "Bir tıkın sizi ne kadar götürdüğü.",
+        "row.multiplier.tip": (
+            "Bir tekerlek tıkının kat ettiği toplam mesafe (tık cinsinden).\n"
+            "1.00 = tam bir tık, 1.40 = %40 ek süzülme.\n"
+            "İpucu: 1.2-1.6 doğal hissettirir; 2.0 üzerinde kayma taşabilir."),
+        "row.friction": "Süzülme",
+        "row.friction.hint": "Düşük değer daha uzun ve yumuşak kuyruk demek.",
+        "row.friction.tip": (
+            "Süzülmenin ne kadar çabuk söneceği.\n"
+            "Her 16.7 ms'de hız bu katsayıyla çarpılır.\n"
+            "0.90 = uzun ipeksi kuyruk, 0.93 = dengeli, 0.96 = çabuk durur."),
+        "row.hz": "Pürüzsüzlük (Hz)",
+        "row.hz.hint": "Yüksek değer daha akıcı, biraz daha CPU.",
+        "row.hz.tip": (
+            "Süzülürken saniyede üretilen olay sayısı.\n"
+            "60-120 Hz ekranlarda 125 Hz yeterli; yüksek yenilemeli ekranlar "
+            "için 200 Hz'e çıkarın.\n"
+            "Yüksek değerler biraz CPU harcar."),
+        "row.velocity": "En yüksek hız",
+        "row.velocity.hint": "Art arda hızlı tıklamalar için üst sınır.",
+        "row.velocity.tip": (
+            "Tekerleği hızlı çevirdiğinizdeki hız sınırı.\n"
+            "Düşük = daha kontrollü, yüksek = daha savruk.\n"
+            "Sadece hızlı serilerde fark eder, tek tıklarda değil."),
+        "safe": "Cihazı hiç devralma (oyun dostu)",
+        "safe.tip": (
+            "Açık: fare sadece okunur. Tıklama ve tekerlek her uygulamada "
+            "çalışır; oyunlar ve girdi cihazını doğrudan okuyan Wine/Proton "
+            "uygulamaları dahil.\n"
+            "Kapalı: tam pürüzsüz kaydırma için cihaz klonlanır, ancak bu "
+            "uygulamalar etkinken fare girdisini kaybedebilir."),
+        "autostart": "Oturumda başlat",
+        "autostart.tip": (
+            "Tray uygulaması oturum açtığınızda kendiliğinden başlar.\n"
+            "Kaydırma servisi ise yukarıdaki anahtarla denetlenir."),
+        "defaults": "Varsayılanlar",
+        "defaults.tip": "1.4x mesafe, 0.93 süzülme, 125 Hz ve 4.0 en yüksek hız.",
+        "language": "Dil",
+        "language.tip": "Bu panelin ve tray menüsünün dili.",
+        "lang.auto": "Otomatik",
+        "preset.soft": "Yumuşak",
+        "preset.balanced": "Dengeli",
+        "preset.firm": "Sıkı",
+        "preset.instant": "Anında",
+        "preset.soft.tip": "Uzun, belirgin süzülme (1.9 x 0.905).",
+        "preset.balanced.tip": "Önerilen orta yol (1.4 x 0.93).",
+        "preset.firm.tip": "Kısa ve kontrollü (1.1 x 0.96).",
+        "preset.instant.tip": "Süzülme yok, neredeyse ham tekerlek (1.0 x 0.99).",
+    },
+}
+
+LANG = "en"
+
+
+def system_lang():
+    values = [os.environ.get(v) for v in ("LC_ALL", "LC_MESSAGES", "LANG")]
+    # Mixed locales are common (LANG=en_US for the terminal, tr_TR for dates):
+    # any Turkish category is a strong hint about the preferred UI language.
+    values += [v for k, v in os.environ.items() if k.startswith("LC_")]
+    if any((v or "").lower().startswith("tr") for v in values):
+        return "tr"
+    return "en"
+
+
+def resolve_lang(cfg):
+    choice = str(cfg.get("language", "auto")).lower()
+    return choice if choice in ("en", "tr") else system_lang()
+
+
+def t(key):
+    return STRINGS.get(LANG, STRINGS["en"]).get(key, STRINGS["en"].get(key, key))
+
+
+def wrapped(text):
+    """GTK tooltips do not wrap reliably; break the lines ourselves."""
+    lines = []
+    for para in text.split("\n"):
+        lines.extend(textwrap.wrap(para, width=54) or [""])
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -198,19 +362,45 @@ def _draw_icon(on, path, S):
     return path
 
 
+def info_icon(key):
+    """Small (i) badge whose tooltip explains the setting in detail."""
+    tip = wrapped(t(key))
+    box = Gtk.EventBox()
+    box.set_valign(Gtk.Align.CENTER)
+    box.set_visible_window(False)
+    box.set_tooltip_text(tip)
+    box.set_has_tooltip(True)
+    theme = Gtk.IconTheme.get_default()
+    if theme.has_icon("dialog-information-symbolic"):
+        img = Gtk.Image.new_from_icon_name("dialog-information-symbolic",
+                                           Gtk.IconSize.MENU)
+        img.set_opacity(0.6)
+        img.set_tooltip_text(tip)
+        box.add(img)
+    else:
+        lbl = Gtk.Label(label="ⓘ")
+        lbl.get_style_context().add_class("dim-label")
+        box.add(lbl)
+    return box
+
+
 # --------------------------------------------------------------------------- #
 # slider row
 # --------------------------------------------------------------------------- #
 class SliderRow(Gtk.Box):
-    def __init__(self, title, hint, lo, hi, step, digits):
+    def __init__(self, title, hint, tip, lo, hi, step, digits, suffix=""):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.suffix = suffix
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.label = Gtk.Label(label=title, xalign=0)
-        self.label.set_hexpand(True)
+        head.pack_start(self.label, False, False, 0)
+        head.pack_start(info_icon(tip), False, False, 0)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        head.pack_start(spacer, True, True, 0)
         self.value = Gtk.Label(xalign=1)
         self.value.get_style_context().add_class("dim-label")
-        head.pack_start(self.label, True, True, 0)
-        head.pack_start(self.value, False, False, 0)
+        head.pack_end(self.value, False, False, 0)
         self.pack_start(head, False, False, 0)
 
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
@@ -228,8 +418,11 @@ class SliderRow(Gtk.Box):
         self.scale.connect("value-changed", self._on_change)
         self._cb = None
 
+    def _fmt(self, v):
+        return f"{v:.{self.scale.get_digits()}f}{self.suffix}"
+
     def _on_change(self, s):
-        self.value.set_text(f"{s.get_value():.{self.scale.get_digits()}f}")
+        self.value.set_text(self._fmt(s.get_value()))
         if self._cb:
             self._cb()
 
@@ -240,7 +433,7 @@ class SliderRow(Gtk.Box):
         self.scale.handler_block_by_func(self._on_change)
         self.scale.set_value(v)
         self.scale.handler_unblock_by_func(self._on_change)
-        self.value.set_text(f"{v:.{self.scale.get_digits()}f}")
+        self.value.set_text(self._fmt(v))
 
 
 # --------------------------------------------------------------------------- #
@@ -248,7 +441,10 @@ class SliderRow(Gtk.Box):
 # --------------------------------------------------------------------------- #
 class Tray:
     def __init__(self):
+        global LANG
         self.cfg = load_cfg()
+        LANG = resolve_lang(self.cfg)
+        print(f"[tray] language={LANG}", flush=True)
         self._pending = 0
         self._building = False
 
@@ -274,16 +470,16 @@ class Tray:
     def _build_menu(self):
         menu = Gtk.Menu()
 
-        self.mi_on = Gtk.CheckMenuItem(label="Enabled")
+        self.mi_on = Gtk.CheckMenuItem(label=t("menu.enabled"))
         self.mi_on.connect("toggled", self._on_menu_toggle)
         menu.append(self.mi_on)
 
-        presets = Gtk.MenuItem(label="Presets")
+        presets = Gtk.MenuItem(label=t("menu.presets"))
         sub = Gtk.Menu()
         self.preset_items = []
         group = None
         for name, mult, fric in PRESETS:
-            it = Gtk.RadioMenuItem(label=name)
+            it = Gtk.RadioMenuItem(label=t("preset." + name))
             if group is None:
                 group = it
             else:
@@ -294,17 +490,17 @@ class Tray:
         presets.set_submenu(sub)
         menu.append(presets)
 
-        mi_settings = Gtk.MenuItem(label="Settings…")
+        mi_settings = Gtk.MenuItem(label=t("menu.settings"))
         mi_settings.connect("activate", lambda *_: self.show_window())
         menu.append(mi_settings)
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        self.mi_tray_auto = Gtk.CheckMenuItem(label="Start on login")
+        self.mi_tray_auto = Gtk.CheckMenuItem(label=t("menu.autostart"))
         self.mi_tray_auto.connect("toggled", self._on_menu_autostart)
         menu.append(self.mi_tray_auto)
 
-        mi_quit = Gtk.MenuItem(label="Quit")
+        mi_quit = Gtk.MenuItem(label=t("menu.quit"))
         mi_quit.connect("activate", self._on_quit)
         menu.append(mi_quit)
 
@@ -340,8 +536,8 @@ class Tray:
 
     # ---------------- window ----------------
     def _build_window(self):
-        win = Gtk.Window(title="Wheel Momentum")
-        win.set_default_size(430, -1)
+        win = Gtk.Window(title=t("window.title"))
+        win.set_default_size(460, -1)
         win.set_border_width(16)
         win.connect("delete-event", self._on_delete)
 
@@ -353,6 +549,8 @@ class Tray:
         title.set_markup("<b>Wheel Momentum</b>")
         head.pack_start(title, True, True, 0)
         self.sw = Gtk.Switch()
+        self.sw.set_tooltip_text(wrapped(t("switch.tip")))
+        self.sw.set_has_tooltip(True)
         self.sw.connect("notify::active", self._on_switch)
         head.pack_end(self.sw, False, False, 0)
         outer.pack_start(head, False, False, 0)
@@ -363,13 +561,14 @@ class Tray:
 
         outer.pack_start(Gtk.Separator(), False, False, 0)
 
-        lbl = Gtk.Label(label="Presets", xalign=0)
+        lbl = Gtk.Label(label=t("presets"), xalign=0)
         outer.pack_start(lbl, False, False, 0)
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         box.set_homogeneous(True)
         self.preset_btns = []
         for name, mult, fric in PRESETS:
-            b = Gtk.Button(label=name)
+            b = Gtk.Button(label=t("preset." + name))
+            b.set_tooltip_text(wrapped(t("preset." + name + ".tip")))
             b.connect("clicked", lambda _b, m=mult, f=fric: self.apply_preset(m, f))
             box.pack_start(b, True, True, 0)
             self.preset_btns.append(b)
@@ -378,20 +577,24 @@ class Tray:
         outer.pack_start(Gtk.Separator(), False, False, 0)
 
         self.s_mult = SliderRow(
-            "Travel per detent",
-            "How far one detent carries you, in detents.",
-            0.6, 2.6, 0.05, 2)
+            t("row.multiplier"),
+            t("row.multiplier.hint"),
+            "row.multiplier.tip",
+            0.6, 2.6, 0.05, 2, "×")
         self.s_fric = SliderRow(
-            "Glide",
-            "Lower means a longer, smoother tail.",
+            t("row.friction"),
+            t("row.friction.hint"),
+            "row.friction.tip",
             0.85, 0.99, 0.005, 3)
         self.s_hz = SliderRow(
-            "Smoothness (Hz)",
-            "Higher is smoother, at a small CPU cost.",
-            60, 240, 5, 0)
+            t("row.hz"),
+            t("row.hz.hint"),
+            "row.hz.tip",
+            60, 240, 5, 0, " Hz")
         self.s_vel = SliderRow(
-            "Max speed",
-            "Ceiling for rapid successive detents.",
+            t("row.velocity"),
+            t("row.velocity.hint"),
+            "row.velocity.tip",
             1.0, 8.0, 0.5, 1)
 
         for row in (self.s_mult, self.s_fric, self.s_hz, self.s_vel):
@@ -401,21 +604,35 @@ class Tray:
         outer.pack_start(Gtk.Separator(), False, False, 0)
 
         bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.cb_auto = Gtk.CheckButton(label="Start on login")
+        self.cb_auto = Gtk.CheckButton(label=t("autostart"))
+        self.cb_auto.set_tooltip_text(wrapped(t("autostart.tip")))
         self.cb_auto.connect("toggled", self._on_auto_toggle)
         bottom.pack_start(self.cb_auto, True, True, 0)
-        b_reset = Gtk.Button(label="Defaults")
+        b_reset = Gtk.Button(label=t("defaults"))
+        b_reset.set_tooltip_text(wrapped(t("defaults.tip")))
         b_reset.connect("clicked", self._on_reset)
         bottom.pack_end(b_reset, False, False, 0)
         outer.pack_start(bottom, False, False, 0)
 
-        self.cb_safe = Gtk.CheckButton(label="Never take the device (game-safe)")
-        self.cb_safe.set_tooltip_text(
-            "On: clicks and scroll keep working in every app, including games "
-            "that read the mouse directly. Off: fully smooth scrolling, but "
-            "such games may lose mouse input.")
+        self.cb_safe = Gtk.CheckButton(label=t("safe"))
+        self.cb_safe.set_tooltip_text(wrapped(t("safe.tip")))
         self.cb_safe.connect("toggled", self._on_safe_toggle)
         outer.pack_start(self.cb_safe, False, False, 0)
+
+        lang_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        lang_lbl = Gtk.Label(label=t("language"), xalign=0)
+        lang_lbl.set_hexpand(True)
+        self.cb_lang = Gtk.ComboBoxText()
+        self.cb_lang.append("auto", t("lang.auto"))
+        self.cb_lang.append("en", "English")
+        self.cb_lang.append("tr", "Türkçe")
+        current = str(self.cfg.get("language", "auto"))
+        self.cb_lang.set_active_id(current if current in ("auto", "en", "tr") else "auto")
+        self.cb_lang.set_tooltip_text(wrapped(t("language.tip")))
+        self.cb_lang.connect("changed", self._on_lang_change)
+        lang_row.pack_start(lang_lbl, True, True, 0)
+        lang_row.pack_end(self.cb_lang, False, False, 0)
+        outer.pack_start(lang_row, False, False, 0)
 
         self._load_to_ui()
         return win
@@ -503,6 +720,30 @@ class Tray:
             sc("disable", TRAY_SERVICE)
         self.sync()
 
+    def _on_lang_change(self, combo):
+        if self._building:
+            return
+        choice = combo.get_active_id() or "auto"
+        if choice == str(self.cfg.get("language", "auto")):
+            return
+        self.cfg["language"] = choice
+        save_cfg(self.cfg)
+        global LANG
+        LANG = resolve_lang(self.cfg)
+        self._rebuild_ui()
+
+    def _rebuild_ui(self):
+        """Rebuild menu and window after a language change."""
+        was_visible = self.win.get_visible()
+        old = self.win
+        self.win = self._build_window()
+        old.destroy()
+        self._build_menu()
+        self.sync()
+        if was_visible:
+            self.win.show_all()
+            self.win.present()
+
     # ---------------- state sync ----------------
     def sync(self):
         state = svc_state()
@@ -518,13 +759,13 @@ class Tray:
         self._building = False
 
         if active:
-            txt = "Enabled"
+            txt = t("enabled")
             self.ind.set_icon_full(self.icon_on, "Wheel Momentum")
         elif state == "failed":
-            txt = "Failed - switch off and on to reset"
+            txt = t("failed")
             self.ind.set_icon_full(self.icon_off, "Wheel Momentum")
         else:
-            txt = "Off" + ("" if enabled else " (also disabled at login)")
+            txt = t("off") if enabled else t("off_login")
             self.ind.set_icon_full(self.icon_off, "Wheel Momentum")
         self.status.set_text(txt)
         self.ind.set_label("", "")

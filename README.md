@@ -55,6 +55,7 @@ editor, browser, Electron app, GTK/Qt — gets the same glide, on Wayland and X1
 - No root daemon: runs as your user, only needs `/dev/uinput` write access.
 - Touchpads and tablets are never touched (they have `ABS_X`, so they're skipped).
 - Tray applet with an enable switch, presets and a settings panel (StatusNotifierItem).
+- English and Turkish UI, following your locale or picked manually in the panel.
 - Two `systemd --user` units, no extra background services.
 - **Fail-safe by design:** the default mode never takes the device; the grab is
   released by the kernel if the daemon dies; a hung event loop is killed by the
@@ -108,9 +109,12 @@ Tray icon (blue mouse when enabled, grey slashed mouse when off):
 |---|---|
 | **Enabled** | starts/stops and enables/disables the daemon |
 | **Presets ▸** | Soft / Balanced / Firm / Instant, applied immediately |
-| **Settings…** | panel with sliders and the *Never take the device* switch |
+| **Settings…** | panel with sliders, presets, language and the *Never take the device* switch |
 | **Start on login** | autostart for the tray applet |
 | **Quit** | exits the applet (daemon keeps running) |
+
+Every setting has an **(i)** badge: hover it for what the value actually does,
+typical ranges and a recommendation. Changes apply while you drag.
 
 Open the panel from a terminal or a keybinding:
 
@@ -138,6 +142,7 @@ from a terminal run `systemctl --user reload wheel-momentum`.
 | Key | Default | Meaning |
 |---|---|---|
 | `mode` | `"additive"` | `additive` = never take the device (safe), `grab` = full takeover (smoother) |
+| `language` | `"auto"` | UI language: `auto` (system locale), `en`, `tr` |
 | `multiplier` | `1.4` | Total travel per detent. `1.0` = exactly one detent, `1.8` = strong inertia |
 | `friction` | `0.93` | Damping per 16.7 ms. `0.90` long glide, `0.96` stops quickly |
 | `hz` | `125` | Emission rate. `200` is smoother, slightly more CPU |

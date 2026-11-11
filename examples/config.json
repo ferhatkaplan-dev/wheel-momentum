@@ -1,5 +1,6 @@
 {
   "mode": "additive",
+  "language": "auto",
   "multiplier": 1.4,
   "friction": 0.93,
   "hz": 125,

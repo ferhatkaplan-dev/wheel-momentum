@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.0
+
+- **Turkish and English UI.** The tray follows your locale (any Turkish `LC_*`
+  category is honoured) and the panel now has a language selector. Stored as
+  `"language": "auto" | "en" | "tr"`.
+- **Info badges.** Every setting has an **(i)** icon; hovering it explains what
+  the value does, its useful range and a recommendation. Presets, autostart,
+  defaults, the game-safe switch and the enable switch have tooltips too.
+- Value labels show units (`1.40×`, `125 Hz`) and the panel is slightly wider so
+  longer translations fit.
+
 ## 1.0.1
 
 - Settings changes no longer restart the daemon: the tray sends `SIGHUP` and the
